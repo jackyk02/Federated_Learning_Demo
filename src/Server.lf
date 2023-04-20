@@ -1,0 +1,371 @@
+target Python {
+    keepalive: true,
+    threading: true,
+    compile-definitions: {
+        EXECUTABLE_PREAMBLE: "",
+        WORKERS_NEEDED_FOR_FEDERATE: "5",
+        NUMBER_OF_FEDERATES: "3",
+        FEDERATED: "",
+        FEDERATED_CENTRALIZED: ""
+    },
+    _fed_setup: "include/_Server_preamble.h"
+}
+
+NONE preamble {=
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import DataLoader, random_split
+from torchvision.datasets import CIFAR10
+import torchvision.transforms as transforms
+from collections import OrderedDict
+from typing import List, Tuple
+import numpy as np
+import copy
+
+DEVICE = torch.device("cpu")
+# CIFAR-10 dataset loading and preprocessing
+NUM_CLIENTS = 2
+BATCH_SIZE = 32
+
+def load_datasets():
+    transform = transforms.Compose(
+        [transforms.ToTensor(), transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))]
+    )
+    trainset = CIFAR10("./dataset", train=True, download=True, transform=transform)
+    testset = CIFAR10("./dataset", train=False, download=True, transform=transform)
+
+    partition_size = len(trainset) // NUM_CLIENTS
+    lengths = [partition_size] * NUM_CLIENTS
+    datasets = random_split(trainset, lengths, torch.Generator().manual_seed(42))
+
+    trainloaders = []
+    valloaders = []
+    for ds in datasets:
+        len_val = len(ds) // 10
+        len_train = len(ds) - len_val
+        lengths = [len_train, len_val]
+        ds_train, ds_val = random_split(ds, lengths, torch.Generator().manual_seed(42))
+        trainloaders.append(DataLoader(ds_train, batch_size=BATCH_SIZE, shuffle=True))
+        valloaders.append(DataLoader(ds_val, batch_size=BATCH_SIZE))
+    testloader = DataLoader(testset, batch_size=BATCH_SIZE)
+    return trainloaders, valloaders, testloader
+
+trainloaders, valloaders, testloader = load_datasets()
+
+# Neural network model
+class Net(nn.Module):
+    def __init__(self) -> None:
+        super(Net, self).__init__()
+        self.conv1 = nn.Conv2d(3, 6, 5)
+        self.pool = nn.MaxPool2d(2, 2)
+        self.conv2 = nn.Conv2d(6, 16, 5)
+        self.fc1 = nn.Linear(16 * 5 * 5, 120)
+        self.fc2 = nn.Linear(120, 84)
+        self.fc3 = nn.Linear(84, 10)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.pool(F.relu(self.conv1(x)))
+        x = self.pool(F.relu(self.conv2(x)))
+        x = x.view(-1, 16 * 5 * 5)
+        x = F.relu(self.fc1(x))
+        x = F.relu(self.fc2(x))
+        x = self.fc3(x)
+        return x
+
+# Training and evaluation functions
+def train(net, dataloader, epochs):
+    criterion = nn.CrossEntropyLoss()
+    optimizer = torch.optim.SGD(net.parameters(), lr=0.001, momentum=0.9)
+
+    for epoch in range(epochs):
+        for i, (inputs, labels) in enumerate(dataloader, 0):
+            inputs, labels = inputs.to(DEVICE), labels.to(DEVICE)
+
+            optimizer.zero_grad()
+            outputs = net(inputs)
+            loss = criterion(outputs, labels)
+            loss.backward()
+            optimizer.step()
+
+def test(net, dataloader):
+    criterion = nn.CrossEntropyLoss()
+    correct = 0
+    total = 0
+    running_loss = 0.0
+
+    with torch.no_grad():
+        for images, labels in dataloader:
+            images, labels = images.to(DEVICE), labels.to(DEVICE)
+            outputs = net(images)
+            loss = criterion(outputs, labels)
+            running_loss += loss.item()
+            _, predicted = torch.max(outputs.data, 1)
+            total += labels.size(0)
+            correct += (predicted == labels).sum().item()
+
+    accuracy = 100 * correct / total
+    average_loss = running_loss / len(dataloader)
+    return average_loss, accuracy
+
+class Client():
+    def __init__(self, net, trainloader, valloader):
+        self.net = copy.deepcopy(net)
+        self.trainloader = trainloader
+        self.valloader = valloader
+
+    def get_parameters(self):
+        return self.get_parameters_from_net(self.net)
+
+    @staticmethod
+    def get_parameters_from_net(net) -> List[np.ndarray]:
+        return [val.cpu().numpy() for _, val in net.state_dict().items()]
+
+    def set_parameters(self, parameters: List[np.ndarray]):
+        self.set_parameters_to_net(self.net, parameters)
+
+    @staticmethod
+    def set_parameters_to_net(net, parameters: List[np.ndarray]):
+        params_dict = zip(net.state_dict().keys(), parameters)
+        state_dict = OrderedDict({k: torch.Tensor(v) for k, v in params_dict})
+        net.load_state_dict(state_dict, strict=True)
+
+    def fit(self, parameters):
+        self.set_parameters(parameters)
+        train(self.net, self.trainloader, epochs=1)
+        return self.get_parameters(), len(self.trainloader), {}
+=}
+preamble {=
+
+=}
+
+reactor ServerReactor {
+    output global_parameter
+    input[2] updated_parameters
+    input[2] num_train_samples
+    state _net
+    state new_params_lst
+
+    reaction(startup) ->
+    global_parameter {=
+        self._net = Net().to(DEVICE)
+        self.new_params_lst = []
+        global_parameter.set(Client.get_parameters_from_net(self._net))
+    =}
+
+    reaction(updated_parameters, num_train_samples) ->
+    global_parameter {=
+        print("Hello")
+
+        #check inputs
+        print("update 0:", len(updated_parameters[0].value))
+        print("samples 0:", num_train_samples[0].value)
+        print("update 1:", len(updated_parameters[1].value))
+        print("samples 1:", num_train_samples[1].value)
+
+        #calculate federated averaging
+        num_of_clients = 2
+        total_samples = num_train_samples[0].value * num_of_clients
+        new_global = [np.zeros_like(param) for param in Client.get_parameters_from_net(self._net)]
+
+        for i in range (num_of_clients):
+            client_parameters = updated_parameters[i].value
+            number_train_points = num_train_samples[i].value
+            for j, param in enumerate(client_parameters):
+                new_global[j] += (number_train_points / total_samples) * param
+
+        #update global model
+        Client.set_parameters_to_net(self._net, new_global)
+
+        #validation for the updated global model
+        test_loss, test_accuracy = test(self._net, testloader)
+        print(f"Test Loss: {test_loss:.4f}, Test Accuracy: {test_accuracy:.2f}%\n")
+        global_parameter.set(new_global)
+    =}
+}
+@_fed_config(network_message_actions="networkMessage,networkMessage_0,networkMessage_1,networkMessage_2")
+main reactor  {
+
+    Server = new ServerReactor()
+    
+    logical action inputControlReactionTrigger
+    logical action networkMessage
+    logical action inputControlReactionTrigger_0
+    logical action networkMessage_0
+    logical action inputControlReactionTrigger_1
+    logical action networkMessage_1
+    logical action inputControlReactionTrigger_2
+    logical action networkMessage_2
+    
+    
+    @_c_body
+    @_unordered
+    reaction(inputControlReactionTrigger) -> Server.updated_parameters {=
+        // **** This reaction is unordered.
+        interval_t max_STP = 0LL;
+        // Wait until the port status is known
+        wait_until_port_status_known(0, max_STP);
+    =}
+    @_c_body
+    @_unordered
+    reaction(networkMessage) -> Server.updated_parameters {=
+        // **** This reaction is unordered.
+        // Acquire the GIL (Global Interpreter Lock) to be able to call Python APIs.
+        PyGILState_STATE gstate;
+        gstate = PyGILState_Ensure();
+        // **** This reaction is unordered.
+        Server.updated_parameters[0]->physical_time_of_arrival = self->_lf__networkMessage.physical_time_of_arrival;
+        PyObject* message_byte_array = PyBytes_FromStringAndSize((char*)networkMessage->token->value, networkMessage->token->length);
+        Py_XINCREF(message_byte_array);
+        PyObject* deserialized_message = PyObject_CallMethod(global_pickler, "loads", "O", message_byte_array);
+        if (deserialized_message == NULL) {
+            if (PyErr_Occurred()) PyErr_Print();
+            lf_print_error_and_exit("Could not deserialize deserialized_message.");
+        }
+        Py_XDECREF(message_byte_array);
+        lf_set(Server.updated_parameters[0], deserialized_message);
+        /* Release the thread. No Python API allowed beyond this point. */
+        PyGILState_Release(gstate);
+    =}
+    @_c_body
+    @_unordered
+    reaction(inputControlReactionTrigger_0) -> Server.num_train_samples {=
+        // **** This reaction is unordered.
+        interval_t max_STP = 0LL;
+        // Wait until the port status is known
+        wait_until_port_status_known(1, max_STP);
+    =}
+    @_c_body
+    @_unordered
+    reaction(networkMessage_0) -> Server.num_train_samples {=
+        // **** This reaction is unordered.
+        // Acquire the GIL (Global Interpreter Lock) to be able to call Python APIs.
+        PyGILState_STATE gstate;
+        gstate = PyGILState_Ensure();
+        // **** This reaction is unordered.
+        Server.num_train_samples[0]->physical_time_of_arrival = self->_lf__networkMessage_0.physical_time_of_arrival;
+        PyObject* message_byte_array = PyBytes_FromStringAndSize((char*)networkMessage_0->token->value, networkMessage_0->token->length);
+        Py_XINCREF(message_byte_array);
+        PyObject* deserialized_message = PyObject_CallMethod(global_pickler, "loads", "O", message_byte_array);
+        if (deserialized_message == NULL) {
+            if (PyErr_Occurred()) PyErr_Print();
+            lf_print_error_and_exit("Could not deserialize deserialized_message.");
+        }
+        Py_XDECREF(message_byte_array);
+        lf_set(Server.num_train_samples[0], deserialized_message);
+        /* Release the thread. No Python API allowed beyond this point. */
+        PyGILState_Release(gstate);
+    =}
+    @_c_body
+    @_unordered
+    reaction(inputControlReactionTrigger_1) -> Server.updated_parameters {=
+        // **** This reaction is unordered.
+        interval_t max_STP = 0LL;
+        // Wait until the port status is known
+        wait_until_port_status_known(2, max_STP);
+    =}
+    @_c_body
+    @_unordered
+    reaction(networkMessage_1) -> Server.updated_parameters {=
+        // **** This reaction is unordered.
+        // Acquire the GIL (Global Interpreter Lock) to be able to call Python APIs.
+        PyGILState_STATE gstate;
+        gstate = PyGILState_Ensure();
+        // **** This reaction is unordered.
+        Server.updated_parameters[1]->physical_time_of_arrival = self->_lf__networkMessage_1.physical_time_of_arrival;
+        PyObject* message_byte_array = PyBytes_FromStringAndSize((char*)networkMessage_1->token->value, networkMessage_1->token->length);
+        Py_XINCREF(message_byte_array);
+        PyObject* deserialized_message = PyObject_CallMethod(global_pickler, "loads", "O", message_byte_array);
+        if (deserialized_message == NULL) {
+            if (PyErr_Occurred()) PyErr_Print();
+            lf_print_error_and_exit("Could not deserialize deserialized_message.");
+        }
+        Py_XDECREF(message_byte_array);
+        lf_set(Server.updated_parameters[1], deserialized_message);
+        /* Release the thread. No Python API allowed beyond this point. */
+        PyGILState_Release(gstate);
+    =}
+    @_c_body
+    @_unordered
+    reaction(inputControlReactionTrigger_2) -> Server.num_train_samples {=
+        // **** This reaction is unordered.
+        interval_t max_STP = 0LL;
+        // Wait until the port status is known
+        wait_until_port_status_known(3, max_STP);
+    =}
+    @_c_body
+    @_unordered
+    reaction(networkMessage_2) -> Server.num_train_samples {=
+        // **** This reaction is unordered.
+        // Acquire the GIL (Global Interpreter Lock) to be able to call Python APIs.
+        PyGILState_STATE gstate;
+        gstate = PyGILState_Ensure();
+        // **** This reaction is unordered.
+        Server.num_train_samples[1]->physical_time_of_arrival = self->_lf__networkMessage_2.physical_time_of_arrival;
+        PyObject* message_byte_array = PyBytes_FromStringAndSize((char*)networkMessage_2->token->value, networkMessage_2->token->length);
+        Py_XINCREF(message_byte_array);
+        PyObject* deserialized_message = PyObject_CallMethod(global_pickler, "loads", "O", message_byte_array);
+        if (deserialized_message == NULL) {
+            if (PyErr_Occurred()) PyErr_Print();
+            lf_print_error_and_exit("Could not deserialize deserialized_message.");
+        }
+        Py_XDECREF(message_byte_array);
+        lf_set(Server.num_train_samples[1], deserialized_message);
+        /* Release the thread. No Python API allowed beyond this point. */
+        PyGILState_Release(gstate);
+    =}
+    @_c_body
+    @_unordered
+    reaction(Server.global_parameter) {=
+        // **** This reaction is unordered.
+        // Acquire the GIL (Global Interpreter Lock) to be able to call Python APIs.
+        PyGILState_STATE gstate;
+        gstate = PyGILState_Ensure();
+        // **** This reaction is unordered.
+        // Sending from Server.global_parameter in federate Server to client1.global_parameter in federate client1
+        if (!Server.global_parameter->is_present) return;
+        if (global_pickler == NULL) lf_print_error_and_exit("The pickle module is not loaded.");
+        PyObject* serialized_pyobject = PyObject_CallMethod(global_pickler, "dumps", "O", Server.global_parameter->value);
+        if (serialized_pyobject == NULL) {
+            if (PyErr_Occurred()) PyErr_Print();
+            lf_print_error_and_exit("Could not serialize serialized_pyobject.");
+        }
+        Py_buffer serialized_message;
+        int returnValue = PyBytes_AsStringAndSize(serialized_pyobject, &serialized_message.buf, &serialized_message.len);
+        if (returnValue == -1) {
+            if (PyErr_Occurred()) PyErr_Print();
+            lf_print_error_and_exit("Could not serialize serialized_message.");
+        }
+        size_t message_length = serialized_message.len;
+        send_timed_message(0, MSG_TYPE_TAGGED_MESSAGE, 0, 0, "federate 0 via the RTI", message_length, serialized_message.buf);
+        /* Release the thread. No Python API allowed beyond this point. */
+        PyGILState_Release(gstate);
+    =}
+    @_c_body
+    @_unordered
+    reaction(Server.global_parameter) {=
+        // **** This reaction is unordered.
+        // Acquire the GIL (Global Interpreter Lock) to be able to call Python APIs.
+        PyGILState_STATE gstate;
+        gstate = PyGILState_Ensure();
+        // **** This reaction is unordered.
+        // Sending from Server.global_parameter in federate Server to client2.global_parameter in federate client2
+        if (!Server.global_parameter->is_present) return;
+        if (global_pickler == NULL) lf_print_error_and_exit("The pickle module is not loaded.");
+        PyObject* serialized_pyobject = PyObject_CallMethod(global_pickler, "dumps", "O", Server.global_parameter->value);
+        if (serialized_pyobject == NULL) {
+            if (PyErr_Occurred()) PyErr_Print();
+            lf_print_error_and_exit("Could not serialize serialized_pyobject.");
+        }
+        Py_buffer serialized_message;
+        int returnValue = PyBytes_AsStringAndSize(serialized_pyobject, &serialized_message.buf, &serialized_message.len);
+        if (returnValue == -1) {
+            if (PyErr_Occurred()) PyErr_Print();
+            lf_print_error_and_exit("Could not serialize serialized_message.");
+        }
+        size_t message_length = serialized_message.len;
+        send_timed_message(0, MSG_TYPE_TAGGED_MESSAGE, 0, 1, "federate 1 via the RTI", message_length, serialized_message.buf);
+        /* Release the thread. No Python API allowed beyond this point. */
+        PyGILState_Release(gstate);
+    =}
+}
